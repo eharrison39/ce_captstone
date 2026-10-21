@@ -1,0 +1,17 @@
+# ESP-IDF generated files
+build/
+managed_components/
+/sdkconfig
+/sdkconfig.old
+
+# Machine-specific VS Code settings
+/.vscode/settings.json
+
+# Python and test caches
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Operating system files
+.DS_Store
+Thumbs.db
