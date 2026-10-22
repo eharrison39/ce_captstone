@@ -25,14 +25,22 @@
 
 static const char *TAG = "lidar_motors";
 typedef struct { gpio_num_t pin; ledc_channel_t channel; const char *position; } motor_t;
-/* Order is left to right when facing in the same direction as the lidar. */
+/*
+ * Motor locations, left to right, when the wearer faces the same direction as
+ * the lidar.  Each motor independently activates when its sector contains a
+ * valid detected object, so several motors can run at the same time.
+ *
+ *   object far left  -> GPIO 27 ("far left")
+ *   object left      -> GPIO 26 ("left")
+ *   object right     -> GPIO 25 ("right")
+ *   object far right -> GPIO 33 ("far right")
+ */
 static const motor_t motors[MOTOR_COUNT] = {
     {GPIO_NUM_27, LEDC_CHANNEL_0, "far left"},
     {GPIO_NUM_26, LEDC_CHANNEL_1, "left"},
     {GPIO_NUM_25, LEDC_CHANNEL_2, "right"},
     {GPIO_NUM_33, LEDC_CHANNEL_4, "far right"},
 };
-typedef struct { uint16_t distance_mm; uint8_t zone; int16_t horizontal_angle_tenths; } target_t;
 static i2c_master_dev_handle_t lidar_device;
 static VL53L5CX_Configuration lidar;
 static VL53L5CX_ResultsData results;
@@ -74,6 +82,12 @@ static void motors_init(void) {
     }
 }
 static uint8_t distance_to_percent(uint16_t distance) {
+    /*
+     * Closer objects feel stronger:
+     *   100 mm or closer: selected motor at 100%
+     *   101--1599 mm:     selected motor scales from 100% down to 35%
+     *   1600 mm or farther: all motors off
+     */
     if (distance >= OFF_DISTANCE_MM) return 0;
     if (distance <= FULL_DISTANCE_MM) return 100;
     return MIN_PERCENT + ((OFF_DISTANCE_MM - distance) * (100U - MIN_PERCENT)) /
@@ -84,21 +98,34 @@ static int16_t zone_to_horizontal_angle(uint8_t zone) {
     return (int16_t)((((int32_t)(2U * scene_column + 1U) - GRID_WIDTH) * FOV_TENTHS_DEG) /
                      (2 * GRID_WIDTH));
 }
-static bool find_nearest_target(const VL53L5CX_ResultsData *frame, target_t *target) {
-    uint16_t nearest = UINT16_MAX;
-    bool found = false;
+static size_t motor_for_angle(int16_t angle);
+/*
+ * Return the closest valid object in each motor's sector.  A motor's strength
+ * is based on the closest object in its own sector, independently of objects
+ * in the other three sectors.  UINT16_MAX means that sector has no object.
+ */
+static void find_nearest_targets_per_motor(const VL53L5CX_ResultsData *frame,
+                                           uint16_t nearest[MOTOR_COUNT]) {
+    for (size_t motor = 0; motor < MOTOR_COUNT; ++motor) nearest[motor] = UINT16_MAX;
     for (uint8_t zone = 0; zone < VL53L5CX_RESOLUTION_8X8; ++zone) {
         const int16_t distance = frame->distance_mm[zone];
         const uint8_t status = frame->target_status[zone];
         if (frame->nb_target_detected[zone] > 0 && (status == 5 || status == 9) &&
-            distance > 0 && (uint16_t)distance < nearest) {
-            nearest = distance; target->zone = zone; found = true;
+            distance > 0) {
+            const size_t motor = motor_for_angle(zone_to_horizontal_angle(zone));
+            if ((uint16_t)distance < nearest[motor]) nearest[motor] = (uint16_t)distance;
         }
     }
-    if (found) { target->distance_mm = nearest; target->horizontal_angle_tenths = zone_to_horizontal_angle(target->zone); }
-    return found;
 }
-/* Four equal sectors across the approximately 45-degree horizontal lidar FOV. */
+/*
+ * Divide the approximately 45-degree horizontal lidar field of view into four
+ * equal sectors.  This returns the motor associated with one lidar zone:
+ *
+ *   far-left quarter  -> motors[0], GPIO 27
+ *   left quarter      -> motors[1], GPIO 26
+ *   right quarter     -> motors[2], GPIO 25
+ *   far-right quarter -> motors[3], GPIO 33
+ */
 static size_t motor_for_angle(int16_t angle) {
     int32_t index = ((int32_t)angle + FOV_TENTHS_DEG / 2) / (FOV_TENTHS_DEG / MOTOR_COUNT);
     if (index < 0) index = 0;
@@ -137,14 +164,21 @@ void app_main(void) {
             vTaskDelay(pdMS_TO_TICKS(100)); continue;
         }
         if (ready) {
-            target_t target;
-            if (vl53l5cx_get_ranging_data(&lidar, &results) == VL53L5CX_STATUS_OK && find_nearest_target(&results, &target)) {
-                const size_t motor = motor_for_angle(target.horizontal_angle_tenths);
-                const uint8_t percent = distance_to_percent(target.distance_mm);
-                motors_off(); motor_set_percent(motor, percent);
-                ESP_LOGI(TAG, "%u mm, %d.%d deg -> %s GPIO %d: %u%%", target.distance_mm,
-                         target.horizontal_angle_tenths / 10, target.horizontal_angle_tenths < 0 ? -(target.horizontal_angle_tenths % 10) : target.horizontal_angle_tenths % 10,
-                         motors[motor].position, motors[motor].pin, percent);
+            if (vl53l5cx_get_ranging_data(&lidar, &results) == VL53L5CX_STATUS_OK) {
+                uint16_t nearest[MOTOR_COUNT];
+                find_nearest_targets_per_motor(&results, nearest);
+
+                /* Set all four motors from this frame.  Several can run at
+                 * once; a covered sensor or object across the whole grid can
+                 * therefore activate every motor. */
+                for (size_t motor = 0; motor < MOTOR_COUNT; ++motor) {
+                    const uint8_t percent = nearest[motor] == UINT16_MAX ? 0 :
+                                            distance_to_percent(nearest[motor]);
+                    motor_set_percent(motor, percent);
+                    if (percent > 0) ESP_LOGI(TAG, "%u mm -> %s GPIO %d: %u%%",
+                                               nearest[motor], motors[motor].position,
+                                               motors[motor].pin, percent);
+                }
             } else motors_off();
         }
         vTaskDelay(pdMS_TO_TICKS(5));
